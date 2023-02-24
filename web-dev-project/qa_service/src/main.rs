@@ -1,16 +1,15 @@
-use std::io::{Error, ErrorKind};
-use std::str::FromStr;
-
-use serde::Serialize;
-use warp::reject::Reject;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use warp::{
-    filters::cors::CorsForbidden, http::Method, http::StatusCode, Filter, Rejection, Reply,
+    filters::cors::CorsForbidden, http::Method, http::StatusCode, reject::Reject, Filter,
+    Rejection, Reply,
 };
 
-#[derive(Debug, Serialize)]
+// === DTO ===
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash)]
 struct QuestionID(String);
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Question {
     id: QuestionID,
     title: String,
@@ -18,43 +17,46 @@ struct Question {
     tags: Option<Vec<String>>,
 }
 
-impl Question {
-    fn new(id: QuestionID, title: String, content: String, tags: Option<Vec<String>>) -> Self {
-        Question {
-            id,
-            title,
-            content,
-            tags,
-        }
-    }
-}
+// === Error handling ===
 
-impl FromStr for QuestionID {
-    type Err = std::io::Error;
-
-    fn from_str(id: &str) -> Result<Self, Self::Err> {
-        match id.is_empty() {
-            false => Ok(QuestionID(id.to_string())),
-            true => Err(Error::new(ErrorKind::InvalidInput, "No id provided")),
-        }
-    }
-}
-
+// Implement custom error
 #[derive(Debug)]
-struct InvalidID;
+enum Error {
+    ParseInt(std::num::ParseIntError),
+    MissingParameters,
+    RangeInvalid,
+}
 
-impl Reject for InvalidID {}
+// 1. Implement the Display trait so Rust knows how to format the error to a string.
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Error::ParseInt(ref error) => {
+                write!(f, "Cannot parse parameter: {}", error)
+            }
+            Error::RangeInvalid => {
+                write!(f, "Range invalid")
+            }
+            Error::MissingParameters => {
+                write!(f, "Missing Parameter")
+            }
+        }
+    }
+}
+
+// 2. Implement Warp’s Reject trait on our error so we can return it in a Warp route handler.
+impl Reject for Error {}
 
 async fn return_error(r: Rejection) -> Result<impl Reply, Rejection> {
-    if let Some(error) = r.find::<CorsForbidden>() {
+    if let Some(error) = r.find::<Error>() {
+        Ok(warp::reply::with_status(
+            error.to_string(),
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ))
+    } else if let Some(error) = r.find::<CorsForbidden>() {
         Ok(warp::reply::with_status(
             error.to_string(),
             StatusCode::FORBIDDEN,
-        ))
-    } else if let Some(InvalidID) = r.find() {
-        Ok(warp::reply::with_status(
-            "No valid ID presented".to_string(),
-            StatusCode::UNPROCESSABLE_ENTITY,
         ))
     } else {
         Ok(warp::reply::with_status(
@@ -64,40 +66,100 @@ async fn return_error(r: Rejection) -> Result<impl Reply, Rejection> {
     }
 }
 
-// === Handler ===
-async fn get_questions() -> Result<impl warp::Reply, warp::Rejection> {
-    let question = Question::new(
-        QuestionID::from_str("1").expect("No id provided"),
-        "First Question".to_string(),
-        "Content of question".to_string(),
-        Some(vec!["faq".to_string()]),
-    );
+// === Parsing ===
+#[derive(Debug)]
+struct Pagination {
+    start: usize,
+    end: usize,
+}
 
-    print!(" === get_questions === ");
-    match question.id.0.parse::<i32>() {
-        Err(_) => Err(warp::reject::custom(InvalidID)),
-        Ok(_) => Ok(warp::reply::json(&question)),
+fn extract_pagination(params: HashMap<String, String>) -> Result<Pagination, Error> {
+    if params.contains_key("start") && params.contains_key("end") {
+        return Ok(Pagination {
+            start: params
+                .get("start")
+                .unwrap()
+                .parse::<usize>()
+                .map_err(Error::ParseInt)?,
+            end: params
+                .get("end")
+                .unwrap()
+                .parse::<usize>()
+                .map_err(Error::ParseInt)?,
+        });
+    }
+
+    Err(Error::MissingParameters)
+}
+
+// === In-Memmory store ===
+#[derive(Clone)]
+struct Store {
+    questions: HashMap<QuestionID, Question>,
+}
+
+impl Store {
+    fn new() -> Self {
+        Store {
+            questions: Self::init(),
+        }
+    }
+
+    fn init() -> HashMap<QuestionID, Question> {
+        let file = include_str!("../questions.json");
+        serde_json::from_str(file).expect("Cannot open questions.json")
     }
 }
 
+// === Handler ===
+async fn get_questions(
+    params: HashMap<String, String>,
+    store: Store,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    if !params.is_empty() {
+        let pagination = extract_pagination(params)?;
+        let res: Vec<Question> = store.questions.values().cloned().collect();
+
+        let len_questions = res.len();
+
+        // println!("len {}", len_questions);
+
+        if pagination.end <= pagination.start || pagination.end > len_questions {
+            return Err(warp::reject::custom(Error::RangeInvalid));
+        }
+
+        let res = &res[pagination.start..pagination.end];
+        Ok(warp::reply::json(&res))
+    } else {
+        let res: Vec<Question> = store.questions.values().cloned().collect();
+
+        Ok(warp::reply::json(&res))
+    }
+}
+
+// === Server ===
 #[tokio::main]
 async fn main() {
+    let store = Store::new();
+    let store_filter = warp::any().map(move || store.clone());
+
     let cors = warp::cors()
         .allow_any_origin()
-        .allow_header("not-in-the-request")
+        .allow_header("content-type")
         .allow_methods(&[Method::PUT, Method::POST, Method::DELETE, Method::GET]);
 
     // create a path Filter
-    let get_items = warp::get()
+    let get_questions = warp::get()
         .and(warp::path("questions"))
         .and(warp::path::end())
-        .and_then(get_questions)
-        .recover(return_error);
+        .and(warp::query())
+        .and(store_filter)
+        .and_then(get_questions);
 
     // routes define
-    let routes = get_items.with(cors);
+    let routes = get_questions.with(cors).recover(return_error);
 
-    print!(" ==== Server is started ==== ");
+    println!(" ==== Server is started ==== ");
     // start the server and pass the route filter to it
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
