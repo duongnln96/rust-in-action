@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 use warp::{
-    filters::cors::CorsForbidden, http::Method, http::StatusCode, reject::Reject, Filter,
-    Rejection, Reply,
+    body::BodyDeserializeError, filters::cors::CorsForbidden, http::Method, http::StatusCode,
+    reject::Reject, Filter, Rejection, Reply,
 };
 
 // === DTO ===
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash)]
 struct QuestionID(String);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash)]
+struct AnswerID(String);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Question {
@@ -15,6 +19,13 @@ struct Question {
     title: String,
     content: String,
     tags: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Answer {
+    id: AnswerID,
+    content: String,
+    question_id: QuestionID,
 }
 
 // === Error handling ===
@@ -25,6 +36,7 @@ enum Error {
     ParseInt(std::num::ParseIntError),
     MissingParameters,
     RangeInvalid,
+    QuestionNotFound,
 }
 
 // 1. Implement the Display trait so Rust knows how to format the error to a string.
@@ -39,6 +51,9 @@ impl std::fmt::Display for Error {
             }
             Error::MissingParameters => {
                 write!(f, "Missing Parameter")
+            }
+            Error::QuestionNotFound => {
+                write!(f, "Question not found")
             }
         }
     }
@@ -57,6 +72,11 @@ async fn return_error(r: Rejection) -> Result<impl Reply, Rejection> {
         Ok(warp::reply::with_status(
             error.to_string(),
             StatusCode::FORBIDDEN,
+        ))
+    } else if let Some(error) = r.find::<BodyDeserializeError>() {
+        Ok(warp::reply::with_status(
+            error.to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
         ))
     } else {
         Ok(warp::reply::with_status(
@@ -95,13 +115,15 @@ fn extract_pagination(params: HashMap<String, String>) -> Result<Pagination, Err
 // === In-Memmory store ===
 #[derive(Clone)]
 struct Store {
-    questions: HashMap<QuestionID, Question>,
+    questions: Arc<RwLock<HashMap<QuestionID, Question>>>,
+    answers: Arc<RwLock<HashMap<AnswerID, Answer>>>,
 }
 
 impl Store {
     fn new() -> Self {
         Store {
-            questions: Self::init(),
+            questions: Arc::new(RwLock::new(Self::init())),
+            answers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -118,7 +140,7 @@ async fn get_questions(
 ) -> Result<impl warp::Reply, warp::Rejection> {
     if !params.is_empty() {
         let pagination = extract_pagination(params)?;
-        let res: Vec<Question> = store.questions.values().cloned().collect();
+        let res: Vec<Question> = store.questions.read().await.values().cloned().collect();
 
         let len_questions = res.len();
 
@@ -131,10 +153,61 @@ async fn get_questions(
         let res = &res[pagination.start..pagination.end];
         Ok(warp::reply::json(&res))
     } else {
-        let res: Vec<Question> = store.questions.values().cloned().collect();
+        let res: Vec<Question> = store.questions.read().await.values().cloned().collect();
 
         Ok(warp::reply::json(&res))
     }
+}
+
+async fn add_question(
+    store: Store,
+    question: Question,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    store
+        .questions
+        .write()
+        .await
+        .insert(question.id.clone(), question);
+    Ok(warp::reply::with_status("Question added", StatusCode::OK))
+}
+
+async fn update_question(
+    id: String,
+    store: Store,
+    question: Question,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    match store.questions.write().await.get_mut(&QuestionID(id)) {
+        Some(q) => *q = question,
+        None => return Err(warp::reject::custom(Error::QuestionNotFound)),
+    }
+
+    Ok(warp::reply::with_status("Question updated", StatusCode::OK))
+}
+
+async fn delete_question(id: String, store: Store) -> Result<impl warp::Reply, warp::Rejection> {
+    match store.questions.write().await.remove(&QuestionID(id)) {
+        Some(_) => Ok(warp::reply::with_status("Question deleted", StatusCode::OK)),
+        None => Err(warp::reject::custom(Error::QuestionNotFound)),
+    }
+}
+
+async fn add_answer(
+    store: Store,
+    params: HashMap<String, String>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let answer = Answer {
+        id: AnswerID("1".to_string()),
+        content: params.get("content").unwrap().to_string(),
+        question_id: QuestionID(params.get("questionId").unwrap().to_string()),
+    };
+
+    store
+        .answers
+        .write()
+        .await
+        .insert(answer.id.clone(), answer);
+
+    Ok(warp::reply::with_status("Answer added", StatusCode::OK))
 }
 
 // === Server ===
@@ -153,11 +226,46 @@ async fn main() {
         .and(warp::path("questions"))
         .and(warp::path::end())
         .and(warp::query())
-        .and(store_filter)
+        .and(store_filter.clone())
         .and_then(get_questions);
 
+    let add_question = warp::post()
+        .and(warp::path("questions"))
+        .and(warp::path::end())
+        .and(store_filter.clone())
+        .and(warp::body::json())
+        .and_then(add_question);
+
+    let update_question = warp::put()
+        .and(warp::path("questions"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(store_filter.clone())
+        .and(warp::body::json())
+        .and_then(update_question);
+
+    let delete_question = warp::delete()
+        .and(warp::path("questions"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(store_filter.clone())
+        .and_then(delete_question);
+
+    let add_answer = warp::post()
+        .and(warp::path("comments"))
+        .and(warp::path::end())
+        .and(store_filter.clone())
+        .and(warp::body::form())
+        .and_then(add_answer);
+
     // routes define
-    let routes = get_questions.with(cors).recover(return_error);
+    let routes = get_questions
+        .or(add_question)
+        .or(update_question)
+        .or(delete_question)
+        .or(add_answer)
+        .with(cors)
+        .recover(return_error);
 
     println!(" ==== Server is started ==== ");
     // start the server and pass the route filter to it
