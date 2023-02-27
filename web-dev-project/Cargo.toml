@@ -1,5 +1,3 @@
 [workspace]
 
-members = [
-    "qa_service",
-]
+members = ["qa_service"]
