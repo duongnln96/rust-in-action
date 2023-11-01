@@ -42,14 +42,6 @@ impl fmt::Display for CliError {
 }
 
 impl Error for CliError {
-    // fn description(&self) -> &str {
-    //     match *self {
-    //         CliError::IoError(ref err) => err.description(),
-    //         CliError::Csv(ref err) => err.description(),
-    //         CliError::NotFound => "not found",
-    //     }
-    // }
-
     fn cause(&self) -> Option<&dyn Error> {
         match *self {
             CliError::IoError(ref err) => Some(err),
