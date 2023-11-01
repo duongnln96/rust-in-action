@@ -1,0 +1,16 @@
+[package]
+name = "anyhow-thiserror"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "rwc"
+path = "src/main.rs"
+
+[lib]
+name = "wordcount"
+
+[dependencies]
+anyhow = "1.0.75"
+thiserror = "1.0.50"
